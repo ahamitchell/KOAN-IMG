@@ -8,4 +8,4 @@ open-clip-torch
 opencv-python
 transformers
 sentencepiece
-streamlit
+PyQt6

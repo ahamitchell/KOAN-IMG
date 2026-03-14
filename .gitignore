@@ -23,6 +23,13 @@ video_state.json
 _bg/
 _ui_tmp/
 
+# Build artifacts
+dist/
+build/
+*.spec
+installer_output/
+venv/
+
 # OS files
 desktop.ini
 Thumbs.db
