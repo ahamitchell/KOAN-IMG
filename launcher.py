@@ -45,7 +45,12 @@ def ensure_venv() -> None:
         return
 
     _print_status("Creating virtual environment...")
-    _run([str(SYSTEM_PYTHON), "-m", "venv", str(VENV_DIR)])
+    # Embedded Python doesn't have venv module, use virtualenv instead
+    _run([str(SYSTEM_PYTHON), "-m", "virtualenv", str(VENV_DIR)],
+         check=False)
+    if not VENV_PYTHON.exists():
+        # Fallback to venv if virtualenv not available (system Python)
+        _run([str(SYSTEM_PYTHON), "-m", "venv", str(VENV_DIR)])
 
     if not VENV_PYTHON.exists():
         _print_status("ERROR: Failed to create virtual environment.")
@@ -151,7 +156,8 @@ def launch_app() -> None:
         sys.exit(1)
 
     _print_status("Launching KOAN.img...")
-    os.execv(str(VENV_PYTHON), [str(VENV_PYTHON), str(app_entry)])
+    proc = subprocess.run([str(VENV_PYTHON), str(app_entry)], cwd=str(APP_DIR))
+    sys.exit(proc.returncode)
 
 
 def main() -> None:

@@ -58,6 +58,9 @@ Source: "version.py"; DestDir: "{app}\app"; Flags: ignoreversion
 Source: "updater.py"; DestDir: "{app}\app"; Flags: ignoreversion
 Source: "requirements.txt"; DestDir: "{app}\app"; Flags: ignoreversion
 
+; Embedded Python (no system Python needed)
+Source: "python\*"; DestDir: "{app}\python"; Flags: ignoreversion recursesubdirs
+
 ; Collage module
 Source: "collage\__init__.py"; DestDir: "{app}\app\collage"; Flags: ignoreversion
 Source: "collage\build_shape_index.py"; DestDir: "{app}\app\collage"; Flags: ignoreversion
