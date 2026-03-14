@@ -502,8 +502,9 @@ class ImageGrid(QScrollArea):
 # ── SeedTile ──────────────────────────────────────────────────────────────────
 
 class SeedTile(QFrame):
-    remove_clicked = pyqtSignal(int)   # index in seed list
-    weight_changed = pyqtSignal(int, float)  # index, new_weight
+    remove_clicked    = pyqtSignal(int)          # index in seed list
+    weight_changed    = pyqtSignal(int, float)   # index, new_weight
+    selection_toggled = pyqtSignal(str, bool)    # path, checked
 
     def __init__(self, index: int, path: str, weight: float = 1.0, parent=None):
         super().__init__(parent)
@@ -516,13 +517,21 @@ class SeedTile(QFrame):
         lay.setContentsMargins(6, 6, 6, 6)
         lay.setSpacing(4)
 
-        # thumbnail
+        # checkbox + thumbnail row
+        thumb_row = QHBoxLayout()
+        thumb_row.setContentsMargins(0, 0, 0, 0)
+        self._cb = QCheckBox()
+        self._cb.setToolTip("Include in selection")
+        self._cb.toggled.connect(lambda v: self.selection_toggled.emit(self.path, v))
+        thumb_row.addWidget(self._cb, 0, Qt.AlignmentFlag.AlignTop)
+
         thumb_lbl = QLabel()
-        thumb_lbl.setFixedSize(316, 160)
+        thumb_lbl.setFixedSize(296, 160)
         thumb_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
         thumb_lbl.setStyleSheet("background:#070a08; border-radius:4px;")
-        self._movie = _attach_thumb(thumb_lbl, path, 316, 160)
-        lay.addWidget(thumb_lbl)
+        self._movie = _attach_thumb(thumb_lbl, path, 296, 160)
+        thumb_row.addWidget(thumb_lbl)
+        lay.addLayout(thumb_row)
 
         # filename label
         name_lbl = QLabel(Path(path).name)
@@ -1163,6 +1172,7 @@ class PickTab(QWidget):
             tile = SeedTile(index=i, path=s["path"], weight=s["weight"])
             tile.remove_clicked.connect(self._remove_seed)
             tile.weight_changed.connect(self._update_weight)
+            tile.selection_toggled.connect(self._on_seed_selected)
             self._seeds_lay.addWidget(tile)
 
     def _add_seed_dialog(self) -> None:
@@ -1190,6 +1200,14 @@ class PickTab(QWidget):
     def _update_weight(self, index: int, weight: float) -> None:
         if 0 <= index < len(self._seeds):
             self._seeds[index]["weight"] = weight
+
+    @pyqtSlot(str, bool)
+    def _on_seed_selected(self, path: str, checked: bool) -> None:
+        """Toggle a seed image in/out of the export selection."""
+        self._grid.selected_paths[path] = checked
+        self._grid.selection_changed.emit(
+            sum(v for v in self._grid.selected_paths.values())
+        )
 
     # ── browse ───────────────────────────────────────────────────────────
     def _browse_index(self) -> None:
@@ -1308,11 +1326,38 @@ class PickTab(QWidget):
         for i, src in enumerate(selected):
             try:
                 src_p = Path(src)
-                if clean:
-                    dst_name = f"{i+1:04d}{src_p.suffix.lower()}"
+                ext = src_p.suffix.lower()
+
+                if ext == ".webp":
+                    # Convert WebP: animated → .gif, static → .jpg
+                    img = Image.open(str(src_p))
+                    animated = getattr(img, "is_animated", False)
+                    if animated:
+                        out_ext = ".gif"
+                        stem = f"{i+1:04d}" if clean else src_p.stem
+                        dst = dest / f"{stem}{out_ext}"
+                        frames = []
+                        durations = []
+                        for frame_idx in range(img.n_frames):
+                            img.seek(frame_idx)
+                            frames.append(img.convert("RGBA").copy())
+                            durations.append(img.info.get("duration", 100))
+                        frames[0].save(
+                            str(dst), save_all=True,
+                            append_images=frames[1:],
+                            duration=durations, loop=0,
+                        )
+                    else:
+                        out_ext = ".jpg"
+                        stem = f"{i+1:04d}" if clean else src_p.stem
+                        dst = dest / f"{stem}{out_ext}"
+                        img.convert("RGB").save(str(dst), "JPEG", quality=95)
                 else:
-                    dst_name = src_p.name
-                shutil.copy2(str(src_p), str(dest / dst_name))
+                    if clean:
+                        dst_name = f"{i+1:04d}{ext}"
+                    else:
+                        dst_name = src_p.name
+                    shutil.copy2(str(src_p), str(dest / dst_name))
             except Exception as exc:
                 errors.append(f"{src}: {exc}")
 
