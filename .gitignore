@@ -1,0 +1,29 @@
+# Virtual environment
+.venv/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# API keys and secrets
+koan_config.json
+
+# User-generated index (10GB+)
+ai_index/
+
+# Runtime state
+.koan_ui_state.json
+video_state.json
+
+# Debug/probe scripts (top-level only)
+/_*
+
+# Temp folders
+_bg/
+_ui_tmp/
+
+# OS files
+desktop.ini
+Thumbs.db
+.DS_Store
