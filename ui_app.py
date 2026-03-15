@@ -354,11 +354,6 @@ class ImageCard(QFrame):
             cap.setWordWrap(True)
             vl.addWidget(cap)
 
-        # filename
-        fn = QLabel(Path(path).name, objectName="caption")
-        fn.setWordWrap(True)
-        vl.addWidget(fn)
-
         # MAKE SEED
         seed_btn = QPushButton("✓ IN SEEDS" if already_seed else "MAKE SEED")
         seed_btn.setEnabled(not already_seed)
@@ -958,7 +953,7 @@ class PickTab(QWidget):
         r_np.addSpacing(12)
         r_np.addWidget(QLabel("Pool:"))
         self._top_k = QSpinBox()
-        self._top_k.setRange(1, 5000)
+        self._top_k.setRange(1, 999999)
         self._top_k.setValue(int(state.get("pick_top_k", 200)))
         r_np.addWidget(self._top_k)
         r_np.addStretch()
