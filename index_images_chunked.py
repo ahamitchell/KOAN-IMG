@@ -4,6 +4,8 @@ import argparse
 import hashlib
 import os
 import sqlite3
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Iterable, Optional
 
@@ -98,6 +100,39 @@ def read_image_first_frame_rgb(path: Path, max_side: int = 1024):
 def stable_id_for_path(p: Path) -> str:
     s = str(p.as_posix()).lower().encode("utf-8", errors="ignore")
     return hashlib.sha1(s).hexdigest()
+
+
+def _prep_image(p: Path) -> Optional[dict]:
+    """CPU-heavy per-image prep. Safe to run in a worker thread.
+
+    Does everything the main loop used to do on the main thread BEFORE the
+    GPU calls: open/decode/resize, color signature, animated-webp/gif check.
+    Returns a dict with img/col/w/h, or None if the file is unreadable.
+
+    Values (max_side, color signature choice, etc.) are identical to the
+    single-threaded path — this only moves the work off the main thread.
+    """
+    try:
+        ext = p.suffix.lower()
+        if ext in SUPPORTED_IMAGE_EXTS:
+            if ext in {".gif", ".webp"}:
+                img = read_image_first_frame_rgb(p, max_side=1024)
+                if _is_animated_image(p):
+                    col = color_signature_lab_hist(img)
+                else:
+                    col = color_signature_from_path(p)
+            else:
+                img = open_image_rgb(p, max_side=1024)
+                col = color_signature_from_path(p)
+        else:
+            img = read_video_first_frame_rgb(p)
+            if img is None:
+                return None
+            col = color_signature_lab_hist(img)
+        w, h = img.size
+        return {"img": img, "col": col, "w": int(w), "h": int(h)}
+    except Exception:
+        return None
 
 
 def db_connect(db_path: Path) -> sqlite3.Connection:
@@ -283,7 +318,15 @@ def main() -> None:
         return
 
     emb = Embedder(model_name=args.model_name, pretrained=args.pretrained)
-    cap = Captioner()
+    try:
+        cap = Captioner()
+    except RuntimeError as e:
+        # GPU OOM — fall back to CPU captioning
+        if "out of memory" in str(e).lower() or "CUDA" in str(e):
+            print("GPU memory full for BLIP — falling back to CPU captioner")
+            cap = Captioner(device="cpu")
+        else:
+            raise
 
     index = _load_faiss(index_path)
     if index is None:
@@ -314,70 +357,95 @@ def main() -> None:
             skipped_existing = 0
             skipped_unreadable = 0
 
-            for p in tqdm(chunk, desc=f"Indexing {offset} to {end}"):
-                p = p.resolve()
-                sid = stable_id_for_path(p)
+            # Spread CPU prep across cores. PIL/NumPy/OpenCV release the GIL
+            # during decode/resize/color-sig, so threads give real multi-core
+            # parallelism here. GPU calls, FAISS insertion order, DB writes,
+            # batch size, and image size are all UNCHANGED — this only moves
+            # per-image CPU work off the main thread.
+            max_workers = max(2, (os.cpu_count() or 4) - 2)
+            prefetch = max_workers * 2
 
-                row = conn.execute("SELECT faiss_idx FROM images WHERE id=?;", (sid,)).fetchone()
-                if row is not None:
-                    skipped_existing += 1
-                    continue
+            chunk_iter = iter(chunk)
+            pending_jobs: deque = deque()
+            exhausted = False
 
-                try:
-                    ext = p.suffix.lower()
+            with ThreadPoolExecutor(max_workers=max_workers) as ex:
+                with tqdm(total=len(chunk), desc=f"Indexing {offset} to {end}") as pbar:
+                    while True:
+                        # Top up the prefetch window. Skipped (already-indexed)
+                        # paths are handled inline — no worker is spawned for
+                        # them, same as the original single-threaded path.
+                        while not exhausted and len(pending_jobs) < prefetch:
+                            try:
+                                p = next(chunk_iter)
+                            except StopIteration:
+                                exhausted = True
+                                break
+                            p_res = p.resolve()
+                            sid = stable_id_for_path(p_res)
+                            row = conn.execute(
+                                "SELECT faiss_idx FROM images WHERE id=?;",
+                                (sid,),
+                            ).fetchone()
+                            if row is not None:
+                                skipped_existing += 1
+                                pbar.update(1)
+                                continue
+                            pending_jobs.append((sid, p_res, ex.submit(_prep_image, p_res)))
 
-                    if ext in SUPPORTED_IMAGE_EXTS:
-                        if ext in {".gif", ".webp"}:
-                            img = read_image_first_frame_rgb(p, max_side=1024)
-                            if _is_animated_image(p):
-                                col = color_signature_lab_hist(img)
-                            else:
-                                col = color_signature_from_path(p)
-                        else:
-                            img = open_image_rgb(p, max_side=1024)
-                            col = color_signature_from_path(p)
-                    else:
-                        img = read_video_first_frame_rgb(p)
-                        if img is None:
+                        if not pending_jobs:
+                            break
+
+                        # Pop in FIFO order → FAISS indices assigned in the
+                        # exact same order as the single-threaded loop.
+                        sid, p_res, fut = pending_jobs.popleft()
+                        prep = fut.result()
+                        pbar.update(1)
+
+                        if prep is None:
                             skipped_unreadable += 1
                             continue
-                        col = color_signature_lab_hist(img)
 
-                    w, h = img.size
-                    feat = emb.embed_pil(img).astype(np.float32).reshape(-1)
+                        img = prep["img"]
+                        col = prep["col"]
+                        w = prep["w"]
+                        h = prep["h"]
 
-                    if int(feat.shape[0]) != int(index.d):
-                        skipped_unreadable += 1
-                        continue
+                        try:
+                            feat = emb.embed_pil(img).astype(np.float32).reshape(-1)
 
-                    feat = l2_normalize(feat)
-                    mt = file_mtime(p)
+                            if int(feat.shape[0]) != int(index.d):
+                                skipped_unreadable += 1
+                                continue
 
-                    caption_text = ""
-                    try:
-                        caption_text = cap.caption(img)
-                    except Exception:
-                        caption_text = ""
-                except Exception:
-                    skipped_unreadable += 1
-                    continue
+                            feat = l2_normalize(feat)
+                            mt = file_mtime(p_res)
 
-                faiss_idx = int(index.ntotal)
-                index.add(feat.reshape(1, -1))
+                            caption_text = ""
+                            try:
+                                caption_text = cap.caption(img)
+                            except Exception:
+                                caption_text = ""
+                        except Exception:
+                            skipped_unreadable += 1
+                            continue
 
-                cur.execute(
-                    "INSERT OR REPLACE INTO images(id, faiss_idx, path, width, height, mtime) VALUES(?,?,?,?,?,?);",
-                    (sid, int(faiss_idx), str(p), int(w), int(h), int(mt)),
-                )
-                cur.execute("INSERT OR REPLACE INTO colors(id, vec) VALUES(?,?);", (sid, np_to_blob(col)))
-                cur.execute("INSERT OR REPLACE INTO captions(id, caption) VALUES(?,?);", (sid, str(caption_text)))
+                        faiss_idx = int(index.ntotal)
+                        index.add(feat.reshape(1, -1))
 
-                indexed_new += 1
+                        cur.execute(
+                            "INSERT OR REPLACE INTO images(id, faiss_idx, path, width, height, mtime) VALUES(?,?,?,?,?,?);",
+                            (sid, int(faiss_idx), str(p_res), int(w), int(h), int(mt)),
+                        )
+                        cur.execute("INSERT OR REPLACE INTO colors(id, vec) VALUES(?,?);", (sid, np_to_blob(col)))
+                        cur.execute("INSERT OR REPLACE INTO captions(id, caption) VALUES(?,?);", (sid, str(caption_text)))
 
-                pending += 1
-                if pending >= int(args.batch_commit):
-                    conn.commit()
-                    pending = 0
+                        indexed_new += 1
+
+                        pending += 1
+                        if pending >= int(args.batch_commit):
+                            conn.commit()
+                            pending = 0
 
             if pending:
                 conn.commit()
