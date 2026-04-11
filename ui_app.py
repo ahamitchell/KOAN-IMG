@@ -144,8 +144,10 @@ def _save_state(d: Dict[str, Any]) -> None:
     except Exception:
         pass
 
-# ── thumbnail cache (synchronous PIL, in-process) ─────────────────────────────
+# ── thumbnail cache (synchronous PIL, in-process, LRU-capped) ────────────────
 _THUMB_CACHE: Dict[tuple, QPixmap] = {}
+_THUMB_ORDER: list = []          # insertion order for LRU eviction
+_THUMB_MAX = 500                 # max cached thumbnails (~200-400 MB)
 
 def _load_thumb(path: str, w: int = THUMB_W, h: int = THUMB_H) -> QPixmap:
     key = (path, w, h)
@@ -173,8 +175,16 @@ def _load_thumb(path: str, w: int = THUMB_W, h: int = THUMB_H) -> QPixmap:
         data = img.tobytes("raw", "RGB")
         qi = QImage(data, img.width, img.height,
                     img.width * 3, QImage.Format.Format_RGB888)
-        px = QPixmap.fromImage(qi)
+        px = QPixmap.fromImage(qi.copy())
+        try:
+            img.close()
+        except Exception:
+            pass
         _THUMB_CACHE[key] = px
+        _THUMB_ORDER.append(key)
+        while len(_THUMB_ORDER) > _THUMB_MAX:
+            old = _THUMB_ORDER.pop(0)
+            _THUMB_CACHE.pop(old, None)
         return px
     except Exception:
         return QPixmap()
@@ -218,7 +228,7 @@ def _extract_video_frames(path: str, w: int, h: int, n: int = 24) -> list:
             data  = img.tobytes("raw", "RGB")
             qi    = QImage(data, img.width, img.height,
                            img.width * 3, QImage.Format.Format_RGB888)
-            frames.append(QPixmap.fromImage(qi))
+            frames.append(QPixmap.fromImage(qi.copy()))
         cap.release()
         return frames
     except Exception:
@@ -317,6 +327,7 @@ class ImageCard(QFrame):
     def __init__(self, path: str, top_label: str, caption: str,
                  selected: bool, already_seed: bool,
                  thumb_w: int = THUMB_W, thumb_h: int = THUMB_H,
+                 show_seed_btn: bool = True,
                  parent=None) -> None:
         super().__init__(parent)
         self.path = path
@@ -355,10 +366,11 @@ class ImageCard(QFrame):
             vl.addWidget(cap)
 
         # MAKE SEED
-        seed_btn = QPushButton("✓ IN SEEDS" if already_seed else "MAKE SEED")
-        seed_btn.setEnabled(not already_seed)
-        seed_btn.clicked.connect(lambda: self.seed_requested.emit(path))
-        vl.addWidget(seed_btn)
+        if show_seed_btn:
+            seed_btn = QPushButton("✓ IN SEEDS" if already_seed else "MAKE SEED")
+            seed_btn.setEnabled(not already_seed)
+            seed_btn.clicked.connect(lambda: self.seed_requested.emit(path))
+            vl.addWidget(seed_btn)
         vl.addStretch()
 
         self._refresh_style(selected)
@@ -385,8 +397,9 @@ class ImageGrid(QScrollArea):
     selection_changed = pyqtSignal(int)   # total selected count
     seed_requested    = pyqtSignal(str)   # path of image to make seed
 
-    def __init__(self, parent=None) -> None:
+    def __init__(self, show_seed_buttons: bool = True, parent=None) -> None:
         super().__init__(parent)
+        self._show_seed_buttons = show_seed_buttons
         self.setWidgetResizable(True)
         self.setFrameShape(QFrame.Shape.NoFrame)
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
@@ -402,6 +415,13 @@ class ImageGrid(QScrollArea):
         self._last_cols: int = 0
         self._thumb_w: int = THUMB_W
         self._thumb_h: int = THUMB_H
+
+    def sizeHint(self):
+        """If vertical scrollbar is disabled, expand to fit all content."""
+        if self.verticalScrollBarPolicy() == Qt.ScrollBarPolicy.ScrollBarAlwaysOff:
+            h = self._inner.sizeHint().height() if self._inner else 300
+            return QSize(super().sizeHint().width(), max(300, h))
+        return super().sizeHint()
 
     def _compute_cols(self) -> int:
         vw = max(1, self.viewport().width())
@@ -466,12 +486,23 @@ class ImageGrid(QScrollArea):
                 already_seed= (p in seed_paths),
                 thumb_w     = self._thumb_w,
                 thumb_h     = self._thumb_h,
+                show_seed_btn = self._show_seed_buttons,
             )
             card.selection_toggled.connect(self._on_toggle)
             card.seed_requested.connect(self.seed_requested)
             row, col = divmod(i, cols)
             self._grid.addWidget(card, row, col)
             self._cards.append(card)
+
+        # If vertical scroll is disabled, resize to fit content
+        if self.verticalScrollBarPolicy() == Qt.ScrollBarPolicy.ScrollBarAlwaysOff:
+            QTimer.singleShot(50, self._update_fixed_height)
+
+    def _update_fixed_height(self) -> None:
+        """Set fixed height to match content when acting as a non-scrolling grid."""
+        h = self._inner.sizeHint().height()
+        if h > 0:
+            self.setFixedHeight(h + 10)
 
     def _on_toggle(self, path: str, checked: bool) -> None:
         self.selected_paths[path] = checked
@@ -670,6 +701,7 @@ class IndexWorker(QThread):
         reset_progress: bool,
         chunk_size:    int,
         batch_commit:  int,
+        include_videos: bool = False,
         parent=None,
     ):
         super().__init__(parent)
@@ -679,6 +711,7 @@ class IndexWorker(QThread):
         self.reset_progress = reset_progress
         self.chunk_size     = chunk_size
         self.batch_commit   = batch_commit
+        self.include_videos = include_videos
         self._stop          = False
 
     def request_stop(self) -> None:
@@ -699,6 +732,8 @@ class IndexWorker(QThread):
             cmd.append("--recursive")
         if self.reset_progress:
             cmd.append("--reset_progress")
+        if self.include_videos:
+            cmd.append("--include_videos")
 
         try:
             proc = subprocess.Popen(
@@ -775,6 +810,11 @@ class IndexTab(QWidget):
         self._chk_reset = QCheckBox("Reset progress")
         self._chk_reset.setChecked(bool(state.get("idx_reset_progress", False)))
         opt_row.addWidget(self._chk_reset)
+
+        self._chk_videos = QCheckBox("Include videos")
+        self._chk_videos.setChecked(bool(state.get("idx_include_videos", False)))
+        self._chk_videos.setToolTip("Index video files (first frame used for CLIP + caption)")
+        opt_row.addWidget(self._chk_videos)
         opt_row.addStretch()
         grp_lay.addLayout(opt_row)
 
@@ -859,6 +899,7 @@ class IndexTab(QWidget):
             reset_progress = self._chk_reset.isChecked(),
             chunk_size     = self._chunk_spin.value(),
             batch_commit   = self._batch_spin.value(),
+            include_videos = self._chk_videos.isChecked(),
         )
         self._worker.log_line.connect(self._append_log)
         self._worker.finished.connect(self._on_done)
@@ -885,6 +926,7 @@ class IndexTab(QWidget):
             "idx_out_index_folder": self._out.text(),
             "idx_recursive":        self._chk_recursive.isChecked(),
             "idx_reset_progress":   self._chk_reset.isChecked(),
+            "idx_include_videos":   self._chk_videos.isChecked(),
             "idx_chunk_size":       self._chunk_spin.value(),
             "idx_batch_commit":     self._batch_spin.value(),
         }
@@ -893,7 +935,8 @@ class IndexTab(QWidget):
 # ── PickTab ───────────────────────────────────────────────────────────────────
 
 class PickTab(QWidget):
-    push_to_video_signal = pyqtSignal(list)   # list[str] of selected image paths
+    push_to_video_signal     = pyqtSignal(list)   # list[str] of selected image paths
+    push_to_narrative_signal = pyqtSignal(list)   # list[str] of selected image paths
 
     def __init__(self, state: Dict, parent=None):
         super().__init__(parent)
@@ -954,6 +997,7 @@ class PickTab(QWidget):
         r_np.addWidget(QLabel("Pool:"))
         self._top_k = QSpinBox()
         self._top_k.setRange(1, 999999)
+        self._top_k.setFixedWidth(100)
         self._top_k.setValue(int(state.get("pick_top_k", 200)))
         r_np.addWidget(self._top_k)
         r_np.addStretch()
@@ -1107,6 +1151,16 @@ class PickTab(QWidget):
         self._btn_push_video.clicked.connect(self._push_to_video)
         toolbar.addWidget(self._btn_push_video)
 
+        self._btn_push_narr = QPushButton("→ NARRATIVE")
+        self._btn_push_narr.setToolTip("Send selected images to NARRATIVE tab as seeds")
+        self._btn_push_narr.setStyleSheet(
+            "QPushButton { color: #050607; background: #40ff6b; font-weight: 700; "
+            "border: none; border-radius: 4px; padding: 4px 12px; }"
+            "QPushButton:hover { background: #60ff8b; }"
+        )
+        self._btn_push_narr.clicked.connect(self._push_to_narrative)
+        toolbar.addWidget(self._btn_push_narr)
+
         right_lay.addLayout(toolbar)
 
         # status label
@@ -1198,8 +1252,50 @@ class PickTab(QWidget):
 
     @pyqtSlot(str, bool)
     def _on_seed_selected(self, path: str, checked: bool) -> None:
-        """Toggle a seed image in/out of the export selection."""
-        self._grid.selected_paths[path] = checked
+        """Toggle a seed image in/out of the results grid as a selected card."""
+        if checked:
+            # Add seed as a pinned+selected item at the top of the grid
+            seed_item = {"path": path, "caption": "(seed image)", "is_seed": True, "is_pinned": True}
+            self._item_cache[path] = seed_item
+            self._grid.selected_paths[path] = True
+            # Rebuild grid with seed card included
+            self._refresh_grid_with_seeds()
+        else:
+            # Remove from selection and rebuild
+            self._grid.selected_paths.pop(path, None)
+            self._refresh_grid_with_seeds()
+
+    def _refresh_grid_with_seeds(self) -> None:
+        """Rebuild the results grid, prepending any checked seed images."""
+        # Gather checked seed paths
+        checked_seeds = []
+        for i in range(self._seeds_lay.count()):
+            w = self._seeds_lay.itemAt(i).widget()
+            if isinstance(w, SeedTile) and w._cb.isChecked():
+                p = w.path
+                checked_seeds.append(
+                    self._item_cache.get(p, {"path": p, "caption": "(seed image)", "is_seed": True, "is_pinned": True})
+                )
+
+        # Gather other selected (pinned) items
+        selected = [p for p, v in self._grid.selected_paths.items() if v and p not in {s["path"] for s in checked_seeds}]
+        pinned = [
+            {**self._item_cache.get(p, {"path": p, "caption": ""}), "is_pinned": True}
+            for p in selected
+        ]
+
+        # Gather non-selected results from cache
+        all_pinned_paths = {s["path"] for s in checked_seeds} | set(selected)
+        rest = [
+            item for item in self._grid._current_items
+            if item["path"] not in all_pinned_paths and not item.get("is_seed")
+        ]
+
+        seed_set = {s["path"] for s in self._seeds}
+        self._grid.populate(checked_seeds + pinned + rest, seed_set)
+        # Re-check the seed cards in the grid
+        for s in checked_seeds:
+            self._grid.selected_paths[s["path"]] = True
         self._grid.selection_changed.emit(
             sum(v for v in self._grid.selected_paths.values())
         )
@@ -1314,7 +1410,16 @@ class PickTab(QWidget):
                 from datetime import datetime
                 subfolder = datetime.now().strftime("export-%Y%m%d-%H%M%S")
         dest = Path(export_root) / subfolder
-        dest.mkdir(parents=True, exist_ok=True)
+        # ensure unique folder — never overwrite a previous export
+        if dest.exists():
+            n = 2
+            while True:
+                candidate = Path(export_root) / f"{subfolder}-{n}"
+                if not candidate.exists():
+                    dest = candidate
+                    break
+                n += 1
+        dest.mkdir(parents=True, exist_ok=False)
 
         clean = self._chk_clean.isChecked()
         errors = []
@@ -1391,6 +1496,12 @@ class PickTab(QWidget):
         if selected:
             self.push_to_video_signal.emit(selected)
 
+    def _push_to_narrative(self) -> None:
+        """Emit selected image paths to the NARRATIVE tab."""
+        selected = self._grid.get_selected()
+        if selected:
+            self.push_to_narrative_signal.emit(selected)
+
 
 # ── MainWindow ────────────────────────────────────────────────────────────────
 
@@ -1418,6 +1529,10 @@ class MainWindow(QMainWindow):
         self._count_lbl = QLabel("")
         self._count_lbl.setStyleSheet("font-size:12px; color:rgba(64,255,107,0.55);")
         hdr_row.addWidget(self._count_lbl)
+        self._btn_about = QPushButton("about")
+        self._btn_about.setFixedWidth(70)
+        self._btn_about.clicked.connect(self._show_about)
+        hdr_row.addWidget(self._btn_about)
         main_lay.addLayout(hdr_row)
 
         # ── tabs
@@ -1427,13 +1542,19 @@ class MainWindow(QMainWindow):
             "QTabBar::tab:selected { border-bottom: 2px solid #40ff6b; }"
         )
 
-        self._pick_tab  = PickTab(state)
-        self._index_tab = IndexTab(state)
-        self._video_tab = VideoTab()
-        self._tabs.addTab(self._pick_tab,  "PICK")
-        self._tabs.addTab(self._index_tab, "INDEX")
-        self._tabs.addTab(self._video_tab, "VIDEO")
+        from narrative_tab import NarrativeTab
+
+        self._pick_tab      = PickTab(state)
+        self._index_tab     = IndexTab(state)
+        self._video_tab     = VideoTab()
+        self._narrative_tab = NarrativeTab(state)
+        self._tabs.addTab(self._pick_tab,      "PICK")
+        self._tabs.addTab(self._narrative_tab,  "NARRATIVE")
+        self._tabs.addTab(self._index_tab,      "INDEX")
+        self._tabs.addTab(self._video_tab,      "VIDEO")
         self._pick_tab.push_to_video_signal.connect(self._on_push_to_video)
+        self._pick_tab.push_to_narrative_signal.connect(self._on_push_to_narrative)
+        self._narrative_tab.push_to_video_signal.connect(self._on_push_to_video)
         main_lay.addWidget(self._tabs, 1)
 
         # ── auto-save timer
@@ -1464,16 +1585,69 @@ class MainWindow(QMainWindow):
         self._count_lbl.setText("")
 
     def _on_push_to_video(self, paths: List[str]) -> None:
-        """Receive paths from PICK tab, push to VIDEO tab, switch to it."""
+        """Receive paths from PICK/NARRATIVE tab, push to VIDEO tab, switch to it."""
         self._video_tab.push_frames(paths)
         self._tabs.setCurrentWidget(self._video_tab)
+
+    def _on_push_to_narrative(self, paths: List[str]) -> None:
+        """Receive paths from PICK tab, push to NARRATIVE tab as seeds."""
+        self._narrative_tab.push_seeds(paths)
+        self._tabs.setCurrentWidget(self._narrative_tab)
 
     def _save_state(self) -> None:
         combined = {}
         combined.update(self._pick_tab.snapshot())
         combined.update(self._index_tab.snapshot())
+        combined.update(self._narrative_tab.snapshot())
         _save_state(combined)
         self._video_tab.save_state()
+        self._narrative_tab.save_state()
+
+    def _show_about(self) -> None:
+        """Show the About dialog. Text was authored by Claude (an AI from
+        Anthropic) on the developer's behalf — the developer explicitly asked
+        the AI to introduce itself as an AI in this panel."""
+        about_html = (
+            "<h2 style='margin:0'>KOAN.img</h2>"
+            "<p style='color:#888;margin-top:2px'>a local-first AI image curation and narrative tool</p>"
+            "<hr>"
+            "<p><b>What it does</b></p>"
+            "<p>KOAN.img indexes your personal image library with CLIP visual "
+            "embeddings, BLIP captions, and a FAISS similarity index — all "
+            "stored locally on your machine. Once indexed, you can search by "
+            "text, search by example image, or build iterative visual "
+            "narratives where each generation's selections seed the next.</p>"
+            "<p>It runs offline on your own GPU. Nothing leaves your computer.</p>"
+            "<p><b>The tabs</b></p>"
+            "<ul>"
+            "<li><b>PICK</b> — text or image queries against your library; "
+            "hand-select results and export clean folders.</li>"
+            "<li><b>NARRATIVE</b> — iterative visual storytelling. Start with "
+            "a seed image or prompt, pick your favourites, and the next "
+            "generation is seeded from your choices. Export the full story, "
+            "seeds first.</li>"
+            "<li><b>INDEX</b> — build or update the searchable catalog for a "
+            "folder of images and videos. Uses CLIP + BLIP on your GPU.</li>"
+            "<li><b>VIDEO</b> — assemble selected frames into videos.</li>"
+            "</ul>"
+            "<p><b>How it stays fast</b></p>"
+            "<p>Per-image CPU prep (decode, resize, colour signature) runs in "
+            "parallel across your CPU cores while the GPU handles CLIP and "
+            "BLIP inference, so neither side sits idle. Progress is "
+            "checkpointed per chunk, so crashes and cancellations don't lose "
+            "work.</p>"
+            "<hr>"
+            "<p style='color:#888;font-size:11px'><i>"
+            "Hi — I'm Claude, an AI assistant built by Anthropic. The "
+            "developer of KOAN.img asked me to write this About panel on "
+            "their behalf and to be upfront that it was written by an AI, so: "
+            "hello from an AI \U0001F44B. I also helped design and implement "
+            "the parallel indexing pipeline, the robustness/heartbeat system, "
+            "and the seed-first narrative export you might have just used. "
+            "Any bugs in those are mine; any good ideas were the developer's."
+            "</i></p>"
+        )
+        QMessageBox.about(self, "About KOAN.img", about_html)
 
     def closeEvent(self, event) -> None:
         self._save_state()
@@ -1484,6 +1658,8 @@ class MainWindow(QMainWindow):
 
 def main() -> None:
     import sys
+    import os
+    os.environ.setdefault("HF_HUB_VERBOSITY", "error")
     app = QApplication(sys.argv)
     app.setApplicationName("KOAN.img")
     app.setStyleSheet(QSS)

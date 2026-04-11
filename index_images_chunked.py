@@ -4,10 +4,17 @@ import argparse
 import hashlib
 import os
 import sqlite3
+import sys
+import time
 from collections import deque
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
 from pathlib import Path
 from typing import Iterable, Optional
+
+# Robustness knobs (do not affect output — only crash recovery / visibility)
+PREP_TIMEOUT_SECS = 30.0    # per-image CPU prep timeout (decode/resize/color sig)
+HEARTBEAT_EVERY = 50        # print a heartbeat line every N processed items
+HEARTBEAT_MAX_IDLE_SECS = 20.0  # also heartbeat if this long since last line
 
 import faiss
 import numpy as np
@@ -109,6 +116,10 @@ def _prep_image(p: Path) -> Optional[dict]:
     GPU calls: open/decode/resize, color signature, animated-webp/gif check.
     Returns a dict with img/col/w/h, or None if the file is unreadable.
 
+    On failure (exception OR unreadable video), logs a KOAN_PREP_ERR line
+    to stderr with the offending path and reason, so "skipped_unreadable"
+    counts in the summary can be traced back to specific files.
+
     Values (max_side, color signature choice, etc.) are identical to the
     single-threaded path — this only moves the work off the main thread.
     """
@@ -127,11 +138,19 @@ def _prep_image(p: Path) -> Optional[dict]:
         else:
             img = read_video_first_frame_rgb(p)
             if img is None:
+                print(
+                    f"KOAN_PREP_ERR VideoReadError: first frame unavailable :: {p}",
+                    file=sys.stderr, flush=True,
+                )
                 return None
             col = color_signature_lab_hist(img)
         w, h = img.size
         return {"img": img, "col": col, "w": int(w), "h": int(h)}
-    except Exception:
+    except Exception as exc:
+        print(
+            f"KOAN_PREP_ERR {type(exc).__name__}: {exc} :: {p}",
+            file=sys.stderr, flush=True,
+        )
         return None
 
 
@@ -369,6 +388,23 @@ def main() -> None:
             pending_jobs: deque = deque()
             exhausted = False
 
+            processed_since_heartbeat = 0
+            last_heartbeat_ts = time.time()
+
+            def _heartbeat(tag: str) -> None:
+                nonlocal last_heartbeat_ts, processed_since_heartbeat
+                print(
+                    f"KOAN_HEARTBEAT {tag} "
+                    f"indexed_new={indexed_new} "
+                    f"skipped_existing={skipped_existing} "
+                    f"skipped_unreadable={skipped_unreadable} "
+                    f"pending={len(pending_jobs)} "
+                    f"chunk={offset}->{end}",
+                    flush=True,
+                )
+                last_heartbeat_ts = time.time()
+                processed_since_heartbeat = 0
+
             with ThreadPoolExecutor(max_workers=max_workers) as ex:
                 with tqdm(total=len(chunk), desc=f"Indexing {offset} to {end}") as pbar:
                     while True:
@@ -390,6 +426,10 @@ def main() -> None:
                             if row is not None:
                                 skipped_existing += 1
                                 pbar.update(1)
+                                processed_since_heartbeat += 1
+                                if processed_since_heartbeat >= HEARTBEAT_EVERY \
+                                        or (time.time() - last_heartbeat_ts) >= HEARTBEAT_MAX_IDLE_SECS:
+                                    _heartbeat("skip")
                                 continue
                             pending_jobs.append((sid, p_res, ex.submit(_prep_image, p_res)))
 
@@ -399,11 +439,42 @@ def main() -> None:
                         # Pop in FIFO order → FAISS indices assigned in the
                         # exact same order as the single-threaded loop.
                         sid, p_res, fut = pending_jobs.popleft()
-                        prep = fut.result()
+
+                        # Timeout guard: if a worker hangs on a bad file
+                        # (PIL choking on corruption, huge animated webp, etc.)
+                        # we don't want to deadlock the whole indexer. Skip
+                        # the offending path and keep going.
+                        try:
+                            prep = fut.result(timeout=PREP_TIMEOUT_SECS)
+                        except FutureTimeout:
+                            print(
+                                f"KOAN_TIMEOUT prep hung >{PREP_TIMEOUT_SECS:.0f}s, "
+                                f"skipping: {p_res}",
+                                file=sys.stderr, flush=True,
+                            )
+                            fut.cancel()  # best-effort; won't stop a running thread
+                            skipped_unreadable += 1
+                            pbar.update(1)
+                            processed_since_heartbeat += 1
+                            continue
+                        except Exception as exc:
+                            print(
+                                f"KOAN_PREP_ERR {type(exc).__name__}: {exc} :: {p_res}",
+                                file=sys.stderr, flush=True,
+                            )
+                            skipped_unreadable += 1
+                            pbar.update(1)
+                            processed_since_heartbeat += 1
+                            continue
+
                         pbar.update(1)
+                        processed_since_heartbeat += 1
 
                         if prep is None:
                             skipped_unreadable += 1
+                            if processed_since_heartbeat >= HEARTBEAT_EVERY \
+                                    or (time.time() - last_heartbeat_ts) >= HEARTBEAT_MAX_IDLE_SECS:
+                                _heartbeat("work")
                             continue
 
                         img = prep["img"]
@@ -446,6 +517,10 @@ def main() -> None:
                         if pending >= int(args.batch_commit):
                             conn.commit()
                             pending = 0
+
+                        if processed_since_heartbeat >= HEARTBEAT_EVERY \
+                                or (time.time() - last_heartbeat_ts) >= HEARTBEAT_MAX_IDLE_SECS:
+                            _heartbeat("work")
 
             if pending:
                 conn.commit()
