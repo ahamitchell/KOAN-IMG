@@ -15,6 +15,7 @@ ai_index/
 # Runtime state
 .koan_ui_state.json
 video_state.json
+narrative_state.json
 
 # Debug/probe scripts (top-level only)
 /_*
