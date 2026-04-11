@@ -546,6 +546,21 @@ class NarrativeTab(QWidget):
         latest_collapsed = max(g["gen_index"] for g in collapsed_gens)
         idx = 0   # flat index across all cards
 
+        # Prepend the initial seed image(s) as "generation 0" (labels 0A,
+        # 0B, 0C…). No weight slider here (seeds are managed in the INITIAL
+        # SEEDS panel) and no re-run button (can't re-run the seed step).
+        for si, seed in enumerate(self._seeds):
+            card = SelectionCard(
+                gen_idx=-1, sel_idx=si,
+                path=seed["path"],
+                weight=seed.get("weight", 1.0),
+                show_weight=False,
+            )
+            self._sel_cards.append(card)
+            row, col = divmod(idx, cols)
+            self._sel_grid.addWidget(card, row * 2, col)
+            idx += 1
+
         for gen in sorted(collapsed_gens, key=lambda g: g["gen_index"]):
             gi = gen["gen_index"]
             is_latest = (gi == latest_collapsed)
@@ -793,7 +808,16 @@ class NarrativeTab(QWidget):
     # ── export ───────────────────────────────────────────────────────────────
 
     def _get_all_selections(self) -> List[tuple]:
-        result = []
+        """Return [(label, path), …] for the full narrative sequence.
+
+        The initial seed image(s) are prepended as "generation 0" with labels
+        "0A", "0B", "0C", … so the seeds are the starting point of the
+        narrative wherever this is consumed — export, push-to-video, etc.
+        Text-only narratives (no seeds) are unchanged.
+        """
+        result = [
+            (_gen_label(-1, i), s["path"]) for i, s in enumerate(self._seeds)
+        ]
         for gen in self._generations:
             gi = gen["gen_index"]
             for si, sel in enumerate(gen.get("selections", [])):
@@ -802,13 +826,6 @@ class NarrativeTab(QWidget):
 
     def _export_all(self) -> None:
         selections = self._get_all_selections()
-        # Prepend initial seed image(s) as "generation 0" (labels "0A", "0B", …)
-        # so the export contains the narrative's starting point as the first
-        # file(s). Text-only narratives (no seeds) are unchanged.
-        seed_selections = [
-            (_gen_label(-1, i), s["path"]) for i, s in enumerate(self._seeds)
-        ]
-        selections = seed_selections + selections
         if not selections:
             QMessageBox.information(self, "KOAN.img", "No selections to export.")
             return
