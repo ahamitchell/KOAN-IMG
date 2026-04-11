@@ -4,7 +4,7 @@ import re
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, Tuple, Union, List
+from typing import Dict, Optional, Tuple, Union, List
 
 import faiss
 import numpy as np

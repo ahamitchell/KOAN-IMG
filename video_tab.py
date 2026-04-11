@@ -30,7 +30,7 @@ from PyQt6.QtWidgets import (
     QSplitter, QTextEdit, QVBoxLayout, QWidget,
 )
 
-from video_api import MODELS, HiggsfieldClient, HiggsfieldError, load_client
+from video_api import MODELS, HiggsfieldClient, HiggsfieldError, FalClient, FalError, KlingClient, KlingError, load_client
 
 
 def _find_ffmpeg() -> Optional[str]:
@@ -72,6 +72,8 @@ STRIP_H     = 168   # height of the scrollable strip widget
 TRANS_W     = 76    # width of the between-frame connector
 
 _THUMB_CACHE: Dict[tuple, QPixmap] = {}
+_THUMB_ORDER: list = []
+_THUMB_MAX = 200
 
 VIDEO_EXTS = {".mp4", ".mov", ".avi", ".webm", ".mkv"}
 
@@ -87,9 +89,10 @@ def _first_video_frame(path: str, w: int, h: int) -> QPixmap:
     frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
     img = Image.fromarray(frame_rgb)
     img.thumbnail((w, h), Image.LANCZOS)
-    qi = QImage(img.tobytes("raw", "RGB"), img.width, img.height,
+    data = img.tobytes("raw", "RGB")
+    qi = QImage(data, img.width, img.height,
                 img.width * 3, QImage.Format.Format_RGB888)
-    return QPixmap.fromImage(qi)
+    return QPixmap.fromImage(qi.copy())
 
 
 def _load_thumb(path: str, w: int = FRAME_W, h: int = FRAME_H) -> QPixmap:
@@ -101,14 +104,20 @@ def _load_thumb(path: str, w: int = FRAME_W, h: int = FRAME_H) -> QPixmap:
         px = _first_video_frame(path, w, h)
     else:
         try:
-            img = Image.open(path)
-            img.thumbnail((w, h), Image.LANCZOS)
-            qi = QImage(img.tobytes("raw", "RGB"), img.width, img.height,
-                        img.width * 3, QImage.Format.Format_RGB888)
-            px = QPixmap.fromImage(qi)
+            with Image.open(path) as img:
+                img = img.convert("RGB")
+                img.thumbnail((w, h), Image.LANCZOS)
+                data = img.tobytes("raw", "RGB")
+                qi = QImage(data, img.width, img.height,
+                            img.width * 3, QImage.Format.Format_RGB888)
+                px = QPixmap.fromImage(qi.copy())
         except Exception:
             px = QPixmap()
     _THUMB_CACHE[key] = px
+    _THUMB_ORDER.append(key)
+    while len(_THUMB_ORDER) > _THUMB_MAX:
+        old = _THUMB_ORDER.pop(0)
+        _THUMB_CACHE.pop(old, None)
     return px
 
 
@@ -175,12 +184,12 @@ class EnhanceWorker(QThread):
 
 
 class ClipWorker(QThread):
-    """Generates one clip via Higgsfield. Emits progress, finished, or error."""
+    """Generates one clip via Higgsfield or fal.ai. Emits progress, finished, or error."""
     progress = pyqtSignal(int, str)   # (idx, status_text)
     finished = pyqtSignal(int, str)   # (idx, dest_path)
     error    = pyqtSignal(int, str)   # (idx, error_msg)
 
-    def __init__(self, idx: int, client: HiggsfieldClient,
+    def __init__(self, idx: int, client,
                  first_frame: str, last_frame: Optional[str],
                  prompt: str, dest_path: str, **gen_kwargs):
         super().__init__()
@@ -1010,7 +1019,7 @@ class VideoTab(QWidget):
         self._clip_workers:    Dict[int, ClipWorker]    = {}
         self._pending_renders: Dict[int, int]           = {}   # idx → remaining queued renders
         self._output_dir: Optional[str] = None
-        self._client: Optional[HiggsfieldClient] = None
+        self._clients: dict = {}  # provider → client (HiggsfieldClient or FalClient)
         self._setup_ui()
         self._load_state()   # restore last session
 
@@ -1206,8 +1215,10 @@ class VideoTab(QWidget):
         _FIELDS = [
             ("higgsfield_api_key",    "Higgsfield Key",    "Key ID from platform.higgsfield.ai → Settings"),
             ("higgsfield_api_secret", "Higgsfield Secret", "Secret from platform.higgsfield.ai → Settings"),
-            ("anthropic_api_key",     "Anthropic Key",     "sk-ant-…  (Claude Haiku for prompt enhancement)"),
             ("fal_api_key",           "fal.ai Key",        "key_id:key_secret  from fal.ai dashboard"),
+            ("kling_access_key",      "Kling Access Key",  "Access Key from app.klingai.com → API"),
+            ("kling_secret_key",      "Kling Secret Key",  "Secret Key from app.klingai.com → API"),
+            ("anthropic_api_key",     "Anthropic Key",     "sk-ant-…  (Claude Haiku for prompt enhancement)"),
         ]
 
         self._api_fields: Dict[str, QLineEdit] = {}
@@ -1587,13 +1598,20 @@ class VideoTab(QWidget):
         self._output_dir = str(out_dir)
         self._log_line(f"Output: {out_dir}")
 
-        # Load Higgsfield client
-        try:
-            self._client = load_client()
-        except Exception as exc:
-            self._log_line(f"API error: {exc}")
-            self._set_status("API key error — check koan_config.json.")
-            return
+        # Pre-load clients for all providers needed
+        providers_needed = set()
+        for i, _ in enumerate(pairs):
+            model_name = transitions[i].get("model", list(MODELS.keys())[0])
+            providers_needed.add(MODELS.get(model_name, {}).get("provider", "higgsfield"))
+
+        self._clients = {}
+        for prov in providers_needed:
+            try:
+                self._clients[prov] = load_client(prov)
+            except Exception as exc:
+                self._log_line(f"API error ({prov}): {exc}")
+                self._set_status(f"API key error for {prov} — check ⚙ API Keys.")
+                return
 
         for i, (first, last) in enumerate(pairs):
             count = transitions[i].get("max_renders", 1)
@@ -1640,12 +1658,27 @@ class VideoTab(QWidget):
         }
         if model_info.get("has_audio"):
             gen_kwargs["generate_audio"] = t.get("audio", True)
+        if model_info.get("kling_mode"):
+            gen_kwargs["kling_mode"] = model_info["kling_mode"]
         last_for_api = last if model_info.get("has_end_frame") else None
 
         t["status"] = "generating"
         self._strip.set_transition_status(i, "generating")
 
-        w = ClipWorker(i, self._client, first, last_for_api, prompt, dest, **gen_kwargs)
+        provider = model_info.get("provider", "higgsfield")
+        client = self._clients.get(provider)
+        if not client:
+            try:
+                client = load_client(provider)
+                self._clients[provider] = client
+            except Exception as exc:
+                self._log_line(f"[T{i+1}] ✗ {provider} key error: {exc}")
+                t["status"] = "error"
+                t["error_msg"] = str(exc)
+                self._strip.set_transition_status(i, "error")
+                return
+
+        w = ClipWorker(i, client, first, last_for_api, prompt, dest, **gen_kwargs)
         w.progress.connect(self._on_clip_progress)
         w.finished.connect(self._on_clip_done)
         w.error.connect(self._on_clip_error)
@@ -1670,11 +1703,13 @@ class VideoTab(QWidget):
         else:
             out_dir = Path(self._output_dir)
 
+        model_name = transitions[idx].get("model", list(MODELS.keys())[0])
+        provider = MODELS.get(model_name, {}).get("provider", "higgsfield")
         try:
-            self._client = load_client()
+            self._clients[provider] = load_client(provider)
         except Exception as exc:
-            self._log_line(f"API error: {exc}")
-            self._set_status("API key error — check koan_config.json.")
+            self._log_line(f"API error ({provider}): {exc}")
+            self._set_status(f"API key error for {provider} — check ⚙ API Keys.")
             return
 
         first, last = pairs[idx]

@@ -2,8 +2,6 @@
 numpy==1.26.4
 pillow
 tqdm
-torch
-torchvision
 open-clip-torch
 opencv-python
 transformers

@@ -86,7 +86,7 @@ def ensure_dependencies() -> None:
     _print_status("Installing PyTorch...")
     _run([str(VENV_PIP), "install",
           "torch", "torchvision",
-          "--index-url", "https://download.pytorch.org/whl/cu121"],
+          "--index-url", "https://download.pytorch.org/whl/cu126"],
          check=False)
 
     # Install remaining dependencies

@@ -22,6 +22,8 @@ USER_FILES = {
     "koan_config.json",
     ".koan_ui_state.json",
     "video_state.json",
+    "video_edit_library.json",
+    "narrative_state.json",
 }
 
 
@@ -90,7 +92,13 @@ def apply_update(zip_url: str, app_dir: Optional[Path] = None) -> bool:
         extracted = [d for d in tmp_dir.iterdir() if d.is_dir()]
         if not extracted:
             return False
-        src_dir = extracted[0]
+        repo_root = extracted[0]
+
+        # The repo has code inside ai_photo_picker/ — that maps to {app}/ on disk
+        src_dir = repo_root / "ai_photo_picker"
+        if not src_dir.is_dir():
+            # Fallback: maybe the zip structure changed
+            src_dir = repo_root
 
         # Copy new files over old ones, skipping user data
         for item in src_dir.rglob("*"):

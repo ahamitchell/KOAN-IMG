@@ -54,6 +54,8 @@ Source: "index_images_chunked.py"; DestDir: "{app}\app"; Flags: ignoreversion
 Source: "video_api.py"; DestDir: "{app}\app"; Flags: ignoreversion
 Source: "video_llm.py"; DestDir: "{app}\app"; Flags: ignoreversion
 Source: "video_tab.py"; DestDir: "{app}\app"; Flags: ignoreversion
+Source: "video_edit_tab.py"; DestDir: "{app}\app"; Flags: ignoreversion
+Source: "narrative_tab.py"; DestDir: "{app}\app"; Flags: ignoreversion
 Source: "version.py"; DestDir: "{app}\app"; Flags: ignoreversion
 Source: "updater.py"; DestDir: "{app}\app"; Flags: ignoreversion
 Source: "requirements.txt"; DestDir: "{app}\app"; Flags: ignoreversion
